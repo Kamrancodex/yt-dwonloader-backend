@@ -4,9 +4,9 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const tmp = require("tmp");
 const fs = require("fs");
-const limiter = require("../middleware/rateLimiter");
+const { cache, client } = require("../../middleware/cache");
+const limiter = require("../../middleware/rateLimiter");
 const ytpl = require("ytpl");
-
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const validateYouTubeUrl = (url) => ytdl.validateURL(url);
@@ -17,7 +17,7 @@ module.exports = (io) => {
 
   let downloadTasks = {}; // Track download tasks
 
-  router.post("/video", async (req, res) => {
+  router.post("/video", cache, async (req, res) => {
     const { url } = req.body;
     if (!url || !validateYouTubeUrl(url)) {
       console.log("Invalid YouTube URL:", url);
@@ -55,12 +55,28 @@ module.exports = (io) => {
         downloadAudioBase: `/api/v1/downloads/audio/download?url=${encodedUrl}&itag=`,
       };
 
+      // Cache the response
+      await client.set(url, JSON.stringify(response), "EX", 3600); // Cache for 1 hour
+
       res.status(200).json(response);
     } catch (error) {
       console.error("Failed to fetch video details:", error);
       res.status(500).send("Failed to fetch video details");
     }
   });
+
+  const createDownloadTask = (url, itag, videoPath, audioPath, outputPath) => {
+    const videoStream = ytdl(url, { quality: itag });
+    const audioStream = ytdl(url, { filter: "audioonly" });
+
+    return {
+      videoStream,
+      audioStream,
+      videoPath,
+      audioPath,
+      outputPath,
+    };
+  };
 
   router.get("/video/download", async (req, res) => {
     const { url, itag, startTime, duration } = req.query;
@@ -167,7 +183,7 @@ module.exports = (io) => {
     }
   });
 
-  router.post("/playlist", async (req, res) => {
+  router.post("/playlist", cache, async (req, res) => {
     const { url } = req.body;
     if (!url || !ytpl.validateID(url)) {
       console.log("Invalid YouTube Playlist URL:", url);
@@ -207,6 +223,8 @@ module.exports = (io) => {
         videos,
         formats: uniqueFormats,
       };
+
+      await client.set(url, JSON.stringify(response), "EX", 3600); // Cache for 1 hour
 
       res.status(200).json(response);
     } catch (error) {

@@ -1,11 +1,12 @@
 const express = require("express");
 const ytdl = require("ytdl-core");
+const ytpl = require("ytpl");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const tmp = require("tmp");
 const fs = require("fs");
-const limiter = require("../middleware/rateLimiter");
-const ytpl = require("ytpl");
+const { cache, client } = require("../../middleware/cache");
+const limiter = require("../../middleware/rateLimiter");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -17,7 +18,7 @@ module.exports = (io) => {
 
   let downloadTasks = {}; // Track download tasks
 
-  router.post("/video", async (req, res) => {
+  router.post("/video", cache, async (req, res) => {
     const { url } = req.body;
     if (!url || !validateYouTubeUrl(url)) {
       console.log("Invalid YouTube URL:", url);
@@ -41,8 +42,6 @@ module.exports = (io) => {
         container: format.container,
       }));
 
-      const duration = info.videoDetails.lengthSeconds; // Get the duration in seconds
-
       const encodedUrl = encodeURIComponent(url);
 
       const response = {
@@ -50,10 +49,12 @@ module.exports = (io) => {
         thumbnail: info.videoDetails.thumbnails[0].url,
         formats: availableVideoFormats,
         audioFormats: availableAudioFormats,
-        duration, // Include the duration in the response
         downloadVideoBase: `/api/v1/downloads/video/download?url=${encodedUrl}&itag=`,
         downloadAudioBase: `/api/v1/downloads/audio/download?url=${encodedUrl}&itag=`,
       };
+
+      // Cache the response
+      await client.set(url, JSON.stringify(response), "EX", 3600); // Cache for 1 hour
 
       res.status(200).json(response);
     } catch (error) {
@@ -62,8 +63,71 @@ module.exports = (io) => {
     }
   });
 
+  router.post("/playlist", cache, async (req, res) => {
+    const { url } = req.body;
+    if (!url || !ytpl.validateID(url)) {
+      console.log("Invalid YouTube Playlist URL:", url);
+      return res.status(400).send("Invalid YouTube Playlist URL");
+    }
+
+    try {
+      const playlist = await ytpl(url);
+      const videos = await Promise.all(
+        playlist.items.map(async (item) => {
+          const info = await ytdl.getInfo(item.shortUrl);
+          const videoFormats = ytdl.filterFormats(info.formats, "videoonly");
+
+          return {
+            title: item.title,
+            url: item.shortUrl,
+            thumbnails: item.thumbnails,
+            formats: videoFormats.map((format) => ({
+              qualityLabel: format.qualityLabel,
+              itag: format.itag,
+              container: format.container,
+            })),
+            downloadVideoBase: `/api/v1/downloads/video/download?url=${encodeURIComponent(
+              item.shortUrl
+            )}&itag=`,
+          };
+        })
+      );
+
+      const allFormats = videos.flatMap((video) => video.formats);
+      const uniqueFormats = Array.from(
+        new Set(allFormats.map((format) => format.itag))
+      ).map((itag) => allFormats.find((format) => format.itag === itag));
+
+      const response = {
+        title: playlist.title,
+        videos,
+        formats: uniqueFormats,
+      };
+
+      await client.set(url, JSON.stringify(response), "EX", 3600); // Cache for 1 hour
+
+      res.status(200).json(response);
+    } catch (error) {
+      console.error("Failed to fetch playlist details:", error);
+      res.status(500).send("Failed to fetch playlist details");
+    }
+  });
+
+  const createDownloadTask = (url, itag, videoPath, audioPath, outputPath) => {
+    const videoStream = ytdl(url, { quality: itag });
+    const audioStream = ytdl(url, { filter: "audioonly" });
+
+    return {
+      videoStream,
+      audioStream,
+      videoPath,
+      audioPath,
+      outputPath,
+    };
+  };
+
   router.get("/video/download", async (req, res) => {
-    const { url, itag, startTime, duration } = req.query;
+    const { url, itag } = req.query;
     if (!url || !validateYouTubeUrl(url)) {
       console.log("Invalid YouTube URL:", url);
       return res.status(400).send("Invalid YouTube URL");
@@ -97,25 +161,12 @@ module.exports = (io) => {
             .on("finish", async () => {
               console.log(`Merging video and audio`);
               io.emit("progress", { taskId, progress: 100, step: "Merging" });
-
-              const ffmpegCommand = ffmpeg()
+              ffmpeg()
                 .input(videoPath)
                 .input(audioPath)
                 .outputOptions("-c:v copy")
-                .outputOptions("-c:a aac");
-
-              if (startTime && duration && duration > 0) {
-                console.log(
-                  `Applying crop with startTime: ${startTime} and duration: ${duration}`
-                );
-                ffmpegCommand.setStartTime(startTime).duration(duration);
-              }
-
-              ffmpegCommand
+                .outputOptions("-c:a aac")
                 .save(outputPath)
-                .on("start", (commandLine) => {
-                  console.log(`FFmpeg command: ${commandLine}`);
-                })
                 .on("progress", (progress) => {
                   io.emit("progress", {
                     taskId,
@@ -167,130 +218,67 @@ module.exports = (io) => {
     }
   });
 
-  router.post("/playlist", async (req, res) => {
-    const { url } = req.body;
-    if (!url || !ytpl.validateID(url)) {
-      console.log("Invalid YouTube Playlist URL:", url);
-      return res.status(400).send("Invalid YouTube Playlist URL");
+  router.get("/audio/download", async (req, res) => {
+    const { url, itag } = req.query;
+    if (!url || !validateYouTubeUrl(url)) {
+      console.log("Invalid YouTube URL:", url);
+      return res.status(400).send("Invalid YouTube URL");
     }
 
     try {
-      const playlist = await ytpl(url);
-      const videos = await Promise.all(
-        playlist.items.map(async (item) => {
-          const info = await ytdl.getInfo(item.shortUrl);
-          const videoFormats = ytdl.filterFormats(info.formats, "videoonly");
+      console.log("Fetching audio info for URL:", url);
+      const info = await ytdl.getInfo(url);
+      const format = info.formats.find((f) => f.itag.toString() === itag);
+      if (!format) {
+        console.log("Desired quality not found for itag:", itag);
+        return res.status(500).send("Desired quality not found");
+      }
 
-          return {
-            title: item.title,
-            url: item.shortUrl,
-            thumbnails: item.thumbnails,
-            formats: videoFormats.map((format) => ({
-              qualityLabel: format.qualityLabel,
-              itag: format.itag,
-              container: format.container,
-            })),
-            downloadVideoBase: `/api/v1/downloads/video/download?url=${encodeURIComponent(
-              item.shortUrl
-            )}&itag=`,
-          };
-        })
-      );
+      console.log("Downloading audio with itag:", itag);
 
-      const allFormats = videos.flatMap((video) => video.formats);
-      const uniqueFormats = Array.from(
-        new Set(allFormats.map((format) => format.itag))
-      ).map((itag) => allFormats.find((format) => format.itag === itag));
-
-      const response = {
-        title: playlist.title,
-        videos,
-        formats: uniqueFormats,
-      };
-
-      res.status(200).json(response);
+      res.header("Content-Disposition", 'attachment; filename="audio.mp3"');
+      ytdl(url, { quality: itag }).pipe(res);
     } catch (error) {
-      console.error("Failed to fetch playlist details:", error);
-      res.status(500).send("Failed to fetch playlist details");
+      console.error("Error downloading audio:", error);
+      res.status(500).send("Error downloading audio");
     }
   });
 
-  const downloadAllVideosInPlaylist = async (playlist, itag, res) => {
-    try {
-      const downloadLinks = [];
-      for (const video of playlist.videos) {
-        const videoPath = tmp.tmpNameSync({ postfix: ".mp4" });
-        const audioPath = tmp.tmpNameSync({ postfix: ".mp3" });
-        const outputPath = tmp.tmpNameSync({ postfix: ".mp4" });
-
-        const taskId = `${video.url}-${itag}`;
-        downloadTasks[taskId] = createDownloadTask(
-          video.url,
-          itag,
-          videoPath,
-          audioPath,
-          outputPath
-        );
-
-        await new Promise((resolve, reject) => {
-          downloadTasks[taskId].videoStream
-            .pipe(fs.createWriteStream(videoPath))
-            .on("finish", async () => {
-              downloadTasks[taskId].audioStream
-                .pipe(fs.createWriteStream(audioPath))
-                .on("finish", async () => {
-                  const ffmpegCommand = ffmpeg()
-                    .input(videoPath)
-                    .input(audioPath)
-                    .outputOptions("-c:v copy")
-                    .outputOptions("-c:a aac")
-                    .save(outputPath)
-                    .on("end", () => {
-                      downloadLinks.push(outputPath);
-                      resolve();
-                    })
-                    .on("error", (err) => {
-                      reject(err);
-                    });
-                })
-                .on("error", (err) => {
-                  reject(err);
-                });
-            })
-            .on("error", (err) => {
-              reject(err);
-            });
-        });
-      }
-
-      res.zip({
-        files: downloadLinks.map((file, index) => ({
-          path: file,
-          name: `video${index + 1}.mp4`,
-        })),
-        filename: "playlist.zip",
-      });
-
-      downloadLinks.forEach((file) => fs.unlinkSync(file));
-    } catch (error) {
-      console.error("Error downloading playlist videos:", error);
-      res.status(500).send("Error downloading playlist videos");
+  // Pause, resume, and cancel endpoints
+  router.post("/video/pause", (req, res) => {
+    const { taskId } = req.body;
+    if (downloadTasks[taskId]) {
+      downloadTasks[taskId].videoStream.pause();
+      downloadTasks[taskId].audioStream.pause();
+      res.status(200).send("Download paused");
+    } else {
+      res.status(404).send("Task not found");
     }
-  };
+  });
 
-  router.get("/playlist/download", async (req, res) => {
-    const { url, itag } = req.query;
-    if (!url || !ytpl.validateID(url)) {
-      console.log("Invalid YouTube Playlist URL:", url);
-      return res.status(400).send("Invalid YouTube Playlist URL");
+  router.post("/video/resume", (req, res) => {
+    const { taskId } = req.body;
+    if (downloadTasks[taskId]) {
+      downloadTasks[taskId].videoStream.resume();
+      downloadTasks[taskId].audioStream.resume();
+      res.status(200).send("Download resumed");
+    } else {
+      res.status(404).send("Task not found");
     }
+  });
 
-    try {
-      const playlist = await ytpl(url);
-      await downloadAllVideosInPlaylist(playlist, itag, res);
-    } catch (error) {
-      console.error("Error downloading playlist:", error);
-      res.status(500).send("Error downloading playlist");
+  router.post("/video/cancel", (req, res) => {
+    const { taskId } = req.body;
+    if (downloadTasks[taskId]) {
+      downloadTasks[taskId].videoStream.destroy();
+      downloadTasks[taskId].audioStream.destroy();
+      fs.unlinkSync(downloadTasks[taskId].videoPath);
+      fs.unlinkSync(downloadTasks[taskId].audioPath);
+      fs.unlinkSync(downloadTasks[taskId].outputPath);
+      delete downloadTasks[taskId];
+      res.status(200).send("Download canceled");
+    } else {
+      res.status(404).send("Task not found");
     }
   });
 
