@@ -129,6 +129,10 @@ Response: 200 OK if canceled successfully, 404 Not Found if the task ID is inval
 Contributing
 Feel free to fork this repository and submit pull requests. Any contributions are welcome!
 
+**Hosted the frontend on digital ocean droplet **
+```
+ytclip.live
+```
 **I HOSTED THE BACKEND ON DIGITAL OCEAN AND AWS AS WELL**
 ```
 https://ytclipbackend.online/
