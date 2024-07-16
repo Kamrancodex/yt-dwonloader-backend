@@ -18,7 +18,7 @@ This project provides a backend service for downloading YouTube videos and audio
 
 1. Clone the repository:
    ```
-   git clone https://github.com/your-username/yt-video-downloader-backend.git
+   git clone https://github.com/kamrancodex/yt-video-downloader-backend.git
    cd yt-video-downloader-backend 
 Install dependencies:
 
